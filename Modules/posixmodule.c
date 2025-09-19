@@ -22,6 +22,7 @@
 #include "pycore_initconfig.h"    // _PyStatus_EXCEPTION()
 #include "pycore_long.h"          // _PyLong_IsNegative()
 #include "pycore_moduleobject.h"  // _PyModule_GetState()
+#include "pycore_namespace.h"     // _PyNamespace_New()
 #include "pycore_object.h"        // _PyObject_LookupSpecial()
 #include "pycore_pylifecycle.h"   // _PyOS_URandom()
 #include "pycore_pystate.h"       // _PyInterpreterState_GET()
@@ -407,6 +408,33 @@ extern char *ctermid_r(char *);
 #  define FSTAT fstat
 #  define STRUCT_STAT struct stat
 #endif
+
+#ifdef HAVE_STATX
+#  pragma weak statx
+/* provide constants introduced later than statx itself */
+#  ifndef STATX_MNT_ID
+#    define STATX_MNT_ID 0x00001000U
+#  endif
+#  ifndef STATX_DIOALIGN
+#    define STATX_DIOALIGN 0x00002000U
+#  endif
+#  ifndef STATX_MNT_ID_UNIQUE
+#    define STATX_MNT_ID_UNIQUE 0x00004000U
+#  endif
+#  ifndef STATX_SUBVOL
+#    define STATX_SUBVOL 0x00008000U
+#  endif
+#  ifndef STATX_WRITE_ATOMIC
+#    define STATX_WRITE_ATOMIC 0x00010000U
+#  endif
+#  ifndef STATX_DIO_READ_ALIGN
+#    define STATX_DIO_READ_ALIGN 0x00020000U
+#  endif
+# define _Py_STATX_KNOWN (STATX_BASIC_STATS | STATX_BTIME | STATX_MNT_ID | \
+                          STATX_DIOALIGN | STATX_MNT_ID_UNIQUE | \
+                          STATX_SUBVOL | STATX_WRITE_ATOMIC | \
+                          STATX_DIO_READ_ALIGN)
+#endif /* HAVE_STATX */
 
 
 #if !defined(EX_OK) && defined(EXIT_SUCCESS)
@@ -2584,12 +2612,46 @@ _posix_free(void *module)
    _posix_clear((PyObject *)module);
 }
 
+
+#define SEC_TO_NS (1000000000LL)
+static PyObject *
+nanosecond_timestamp(_posixstate *state, time_t sec, unsigned long nsec) {
+    /* 1677-09-21 00:12:44 to 2262-04-11 23:47:15 UTC inclusive */
+    if ((LLONG_MIN/SEC_TO_NS) <= sec && sec <= (LLONG_MAX/SEC_TO_NS - 1)) {
+        return PyLong_FromLongLong(sec * SEC_TO_NS + nsec);
+    }
+    else {
+        PyObject *s_in_ns = NULL;
+        PyObject *s = _PyLong_FromTime_t(sec);
+        PyObject *ns_fractional = PyLong_FromUnsignedLong(nsec);
+        if (s == NULL || ns_fractional == NULL) {
+            goto exit;
+        }
+
+        s_in_ns = PyNumber_Multiply(s, state->billion);
+        if (s_in_ns == NULL) {
+            goto exit;
+        }
+
+        PyObject *ns_total = PyNumber_Add(s_in_ns, ns_fractional);
+        if (ns_total == NULL) {
+            goto exit;
+        }
+        return ns_total;
+
+    exit:
+        Py_XDECREF(s);
+        Py_XDECREF(ns_fractional);
+        Py_XDECREF(s_in_ns);
+        return NULL;
+    }
+}
+
 static int
 fill_time(_posixstate *state, PyObject *v, int s_index, int f_index,
           int ns_index, time_t sec, unsigned long nsec)
 {
     assert(!PyErr_Occurred());
-#define SEC_TO_NS (1000000000LL)
     assert(nsec < SEC_TO_NS);
 
     if (s_index >= 0) {
@@ -2608,50 +2670,18 @@ fill_time(_posixstate *state, PyObject *v, int s_index, int f_index,
         PyStructSequence_SET_ITEM(v, f_index, float_s);
     }
 
-    int res = -1;
     if (ns_index >= 0) {
-        /* 1677-09-21 00:12:44 to 2262-04-11 23:47:15 UTC inclusive */
-        if ((LLONG_MIN/SEC_TO_NS) <= sec && sec <= (LLONG_MAX/SEC_TO_NS - 1)) {
-            PyObject *ns_total = PyLong_FromLongLong(sec * SEC_TO_NS + nsec);
-            if (ns_total == NULL) {
-                return -1;
-            }
-            PyStructSequence_SET_ITEM(v, ns_index, ns_total);
-            assert(!PyErr_Occurred());
-            res = 0;
+        PyObject *ns_total = nanosecond_timestamp(state, sec, nsec);
+        if (ns_total == NULL) {
+            return -1;
         }
-        else {
-            PyObject *s_in_ns = NULL;
-            PyObject *ns_total = NULL;
-            PyObject *s = _PyLong_FromTime_t(sec);
-            PyObject *ns_fractional = PyLong_FromUnsignedLong(nsec);
-            if (s == NULL || ns_fractional == NULL) {
-                goto exit;
-            }
-
-            s_in_ns = PyNumber_Multiply(s, state->billion);
-            if (s_in_ns == NULL) {
-                goto exit;
-            }
-
-            ns_total = PyNumber_Add(s_in_ns, ns_fractional);
-            if (ns_total == NULL) {
-                goto exit;
-            }
-            PyStructSequence_SET_ITEM(v, ns_index, ns_total);
-            assert(!PyErr_Occurred());
-            res = 0;
-
-        exit:
-            Py_XDECREF(s);
-            Py_XDECREF(ns_fractional);
-            Py_XDECREF(s_in_ns);
-        }
+        PyStructSequence_SET_ITEM(v, ns_index, ns_total);
     }
 
-    return res;
-    #undef SEC_TO_NS
+    assert(!PyErr_Occurred());
+    return 0;
 }
+#undef SEC_TO_NS
 
 #ifdef MS_WINDOWS
 static PyObject*
@@ -3275,6 +3305,184 @@ os_lstat_impl(PyObject *module, path_t *path, int dir_fd)
     int follow_symlinks = 0;
     return posix_do_stat(module, "lstat", path, dir_fd, follow_symlinks);
 }
+
+
+#ifdef HAVE_STATX
+static int
+optional_bool_converter(PyObject *arg, void *addr) {
+    int value;
+    if (arg == Py_None) {
+        value = -1;
+    }
+    else {
+        value = Py_IsTrue(arg);
+        if (value < 0) {
+            return 0;
+        }
+    }
+    *((int *)addr) = value;
+    return 1;
+}
+
+static PyObject *
+_PyNamespace_fromstructstatx(PyObject *module, struct statx *stx,
+                             unsigned int fill_mask) {
+    PyObject *dict = PyDict_New();
+    if (dict == NULL) {
+        return NULL;
+    }
+
+#define SET_ATTR_IF(name, cond, expr) \
+    do { \
+        if (cond) { \
+            PyObject *obj = expr; \
+            if (obj == NULL) { \
+                goto error; \
+            } \
+            if (PyDict_SetItemString(dict, (name), obj) == -1) { \
+                Py_DECREF(obj); \
+                goto error; \
+            } \
+        } \
+    } while (0)
+#define SET_ATTR(name, expr) SET_ATTR_IF((name), true, (expr))
+#define SET_ATTR_IF_BIT(name, bit, expr) SET_ATTR_IF((name), fill_mask & (bit), (expr))
+
+    SET_ATTR("stx_mask", PyLong_FromUInt32(stx->stx_mask));
+    SET_ATTR("st_blksize", PyLong_FromUInt32(stx->stx_blksize));
+    SET_ATTR("stx_attributes", PyLong_FromUInt64(stx->stx_attributes));
+    SET_ATTR_IF_BIT("st_nlink", STATX_NLINK, PyLong_FromUInt32(stx->stx_nlink));
+    SET_ATTR_IF_BIT("st_uid", STATX_UID, _PyLong_FromUid(stx->stx_uid));
+    SET_ATTR_IF_BIT("st_gid", STATX_GID, _PyLong_FromUid(stx->stx_gid));
+    SET_ATTR_IF_BIT("st_mode", STATX_TYPE | STATX_MODE, PyLong_FromUInt32(stx->stx_mode));
+    SET_ATTR_IF_BIT("st_ino", STATX_INO, PyLong_FromUInt64(stx->stx_ino));
+    SET_ATTR_IF_BIT("st_size", STATX_SIZE, PyLong_FromUInt64(stx->stx_size));
+    SET_ATTR_IF_BIT("st_blocks", STATX_BLOCKS, PyLong_FromUInt64(stx->stx_blocks));
+    SET_ATTR("stx_attributes_mask", PyLong_FromUInt64(stx->stx_attributes_mask));
+
+    _posixstate *state = get_posix_state(module);
+#define SET_ATTR_IF_BIT_TS(name, bit, ts) \
+    do { \
+        if (fill_mask & (bit)) { \
+            SET_ATTR((name), PyFloat_FromDouble((double)(ts).tv_sec + 1e-9 * (ts).tv_nsec)); \
+            SET_ATTR(name "_ns", nanosecond_timestamp(state, (ts).tv_sec, (ts).tv_nsec)); \
+        } \
+    } while (0)
+    SET_ATTR_IF_BIT_TS("st_atime", STATX_ATIME, stx->stx_atime);
+    SET_ATTR_IF_BIT_TS("st_mtime", STATX_MTIME, stx->stx_mtime);
+    SET_ATTR_IF_BIT_TS("st_ctime", STATX_CTIME, stx->stx_ctime);
+    SET_ATTR_IF_BIT_TS("st_birthtime", STATX_BTIME, stx->stx_btime);
+
+    SET_ATTR("st_rdev", _PyLong_FromDev(makedev(stx->stx_rdev_major, stx->stx_rdev_minor)));
+    SET_ATTR("st_dev", _PyLong_FromDev(makedev(stx->stx_dev_major, stx->stx_dev_minor)));
+
+    #define SET_ATTR_IF_BIT_OFFSET(name, bit, offset, length) \
+    do { \
+        void *addr = (unsigned char *)&stx + (offset); \
+        SET_ATTR_IF_BIT((name), (bit), PyLong_FromUnsignedNativeBytes(addr, (length), -1)); \
+    } while (0)
+    SET_ATTR_IF_BIT_OFFSET("stx_mnt_id", STATX_MNT_ID | STATX_MNT_ID_UNIQUE, 144, 8);
+    SET_ATTR_IF_BIT_OFFSET("stx_dio_mem_align", STATX_DIOALIGN, 152, 4);
+    SET_ATTR_IF_BIT_OFFSET("stx_dio_offset_align", STATX_DIOALIGN, 156, 4);
+    SET_ATTR_IF_BIT_OFFSET("stx_subvol", STATX_SUBVOL, 160, 8);
+    SET_ATTR_IF_BIT_OFFSET("stx_atomic_write_unit_min", STATX_WRITE_ATOMIC, 168, 4);
+    SET_ATTR_IF_BIT_OFFSET("stx_atomic_write_unit_max", STATX_WRITE_ATOMIC, 172, 4);
+    SET_ATTR_IF_BIT_OFFSET("stx_atomic_write_segments_max", STATX_WRITE_ATOMIC, 176, 4);
+    SET_ATTR_IF_BIT_OFFSET("stx_dio_read_offset_align", STATX_DIO_READ_ALIGN, 180, 4);
+    SET_ATTR_IF_BIT_OFFSET("stx_atomic_write_unit_max_opt", STATX_WRITE_ATOMIC, 184, 4);
+
+#undef SET_ATTR_IF_BIT_OFFSET
+#undef SET_ATTR_IF_BIT_TS
+#undef SET_ATTR_IF_BIT
+#undef SET_ATTR
+#undef SET_ATTR_IF
+
+    PyObject *ns = _PyNamespace_New(dict);
+    Py_DECREF(dict);
+    return ns;
+
+error:
+    Py_DECREF(dict);
+    return NULL;
+}
+
+/*[python input]
+class optional_bool_converter(CConverter):
+    type = 'int'
+    converter = 'optional_bool_converter'
+[python start generated code]*/
+/*[python end generated code: output=da39a3ee5e6b4b0d input=47de85b300eeb19e]*/
+
+/*[clinic input]
+
+os.statx
+
+    path : path_t(allow_fd=True)
+        Path to be examined; can be string, bytes, a path-like object or
+        open-file-descriptor int.
+
+    mask: unsigned_int(bitwise=True)
+        A bitmask of STATX_* constants defining the requested information.
+
+    *
+
+    dir_fd : dir_fd = None
+        If not None, it should be a file descriptor open to a directory,
+        and path should be a relative string; path will then be relative to
+        that directory.
+
+    follow_symlinks: bool = True
+        If False, and the last element of the path is a symbolic link,
+        statx will examine the symbolic link itself instead of the file
+        the link points to.
+
+    sync: optional_bool(c_default='-1') = None
+        If True, statx will return up-to-date values, even if doing so is
+        expensive.  If False, statx will return cached values if possible.
+        If None, statx lets the operating system decide.
+
+Perform a statx system call on the given path.
+
+It's an error to use dir_fd or follow_symlinks when specifying path as
+  an open file descriptor.
+
+[clinic start generated code]*/
+
+static PyObject *
+os_statx_impl(PyObject *module, path_t *path, unsigned int mask, int dir_fd,
+              int follow_symlinks, int sync)
+/*[clinic end generated code: output=fe385235585f3d07 input=148c4fce440ca53a]*/
+{
+    if (path_and_dir_fd_invalid("statx", path, dir_fd) ||
+        dir_fd_and_fd_invalid("statx", dir_fd, path->fd) ||
+        fd_and_follow_symlinks_invalid("statx", path->fd, follow_symlinks))
+        return NULL;
+
+    /* Future bits may refer to members beyond the current size of struct
+       statx, so we need to mask them off to prevent memory corruption. */
+    mask &= _Py_STATX_KNOWN;
+    int flags = AT_NO_AUTOMOUNT | (follow_symlinks ? 0 : AT_SYMLINK_NOFOLLOW);
+    if (sync != -1) {
+        flags |= sync ? AT_STATX_FORCE_SYNC : AT_STATX_DONT_SYNC;
+    }
+
+    int result;
+    struct statx stx;
+    Py_BEGIN_ALLOW_THREADS
+    if (path->fd != -1) {
+        result = statx(path->fd, "", flags | AT_EMPTY_PATH, mask, &stx);
+    }
+    else {
+        result = statx(dir_fd, path->narrow, flags, mask, &stx);
+    }
+    Py_END_ALLOW_THREADS
+
+    if (result != 0) {
+        return path_error(path);
+    }
+    return _PyNamespace_fromstructstatx(module, &stx, mask);
+}
+#endif /* HAVE_STATX */
 
 
 /*[clinic input]
@@ -17025,6 +17233,7 @@ os__emscripten_log_impl(PyObject *module, const char *arg)
 
 static PyMethodDef posix_methods[] = {
     OS_STAT_METHODDEF
+    OS_STATX_METHODDEF
     OS_ACCESS_METHODDEF
     OS_TTYNAME_METHODDEF
     OS_CHDIR_METHODDEF
@@ -17870,6 +18079,30 @@ all_ins(PyObject *m)
     if (PyModule_Add(m, "NODEV", _PyLong_FromDev(NODEV))) return -1;
 #endif
 
+#ifdef HAVE_STATX
+    if (PyModule_AddIntMacro(m, STATX_TYPE)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_MODE)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_NLINK)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_UID)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_GID)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_ATIME)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_MTIME)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_CTIME)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_INO)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_SIZE)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_BLOCKS)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_BASIC_STATS)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_BTIME)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_MNT_ID)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_DIOALIGN)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_MNT_ID_UNIQUE)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_SUBVOL)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_WRITE_ATOMIC)) return -1;
+    if (PyModule_AddIntMacro(m, STATX_DIO_READ_ALIGN)) return -1;
+    /* STATX_ALL intentionally omitted because it is deprecated */
+    /* STATX_ATTR_* constants are in the stat module */
+#endif /* HAVE_STATX */
+
 #if defined(__APPLE__)
     if (PyModule_AddIntConstant(m, "_COPYFILE_DATA", COPYFILE_DATA)) return -1;
     if (PyModule_AddIntConstant(m, "_COPYFILE_STAT", COPYFILE_STAT)) return -1;
@@ -18136,6 +18369,27 @@ posixmodule_exec(PyObject *m)
             return -1;
         }
         if (PyDict_PopString(dct, "preadv", NULL) < 0) {
+            return -1;
+        }
+    }
+#endif
+
+#ifdef HAVE_STATX
+    /* We retract os.statx if:
+       - the weakly-linked statx wrapper function is not available (old libc)
+       - the wrapper function fails with ENOSYS (libc built without fallback
+         running on an old kernel)
+       - the wrapper function fails with EINVAL on sync flags (glibc's
+         emulation of statx via stat fails in this way) */
+    struct statx stx;
+    if (statx == NULL
+        || (statx(-1, "/", AT_STATX_DONT_SYNC, 0, &stx) == -1
+            && (errno == ENOSYS || errno == EINVAL))) {
+        PyObject* dct = PyModule_GetDict(m);
+        if (dct == NULL) {
+            return -1;
+        }
+        if (PyDict_PopString(dct, "statx", NULL) < 0) {
             return -1;
         }
     }

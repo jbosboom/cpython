@@ -3383,6 +3383,63 @@ features:
       Added the :attr:`st_birthtime` member on Windows.
 
 
+.. function:: statx(path, mask, *, dir_fd=None, follow_symlinks=True, sync=None)
+
+   Get the status of a file or file descriptor by performing a :c:func:`!statx`
+   system call on the given path. *path* may be specified as either a string or
+   bytes -- directly or indirectly through the :class:`PathLike` interface --
+   or as an open file descriptor. *mask* is a combination of the module-level
+   :const:`STATX_* <STATX_TYPE>` constants specifying the information to
+   retrieve. Returns a :class:`types.SimpleNamespace` object with attributes
+   from :c:struct:`!statx` corresponding to the set bits in *mask* and the
+   unconditionally valid members.  The :attr:`!stx_mask` attribute, which may
+   differ from *mask*, specifies the validity of the information retrieved.
+
+   The optional parameter *sync* controls the freshness of the returned
+   information.  ``sync=True`` requests that the kernel return up-to-date
+   information, even when doing so is expensive (for example, requiring a
+   round trip to the server for a file on a network filesystem).
+   ``sync=False`` requests that the kernel return cached information if
+   available.  ``sync=None`` expresses no preference, in which case the kernel
+   will return information as fresh as :func:`~os.stat` does.
+
+   This function supports :ref:`specifying a file descriptor <path_fd>`,
+   :ref:`paths relative to directory descriptors <dir_fd>`, and
+   :ref:`not following symlinks <follow_symlinks>`.
+
+   .. seealso:: The :manpage:`statx(2)` man page.
+
+   .. availability:: Linux >= 4.11 with glibc >= 2.28.
+
+   .. versionadded:: next
+
+.. data:: STATX_TYPE
+          STATX_MODE
+          STATX_NLINK
+          STATX_UID
+          STATX_GID
+          STATX_ATIME
+          STATX_MTIME
+          STATX_CTIME
+          STATX_INO
+          STATX_SIZE
+          STATX_BLOCKS
+          STATX_BASIC_STATS
+          STATX_BTIME
+          STATX_MNT_ID
+          STATX_DIOALIGN
+          STATX_MNT_ID_UNIQUE
+          STATX_SUBVOL
+          STATX_WRITE_ATOMIC
+          STATX_DIO_READ_ALIGN
+
+   Bitflags for use as the *mask* parameter to :func:`os.statx`.
+
+   .. availability:: Linux >= 4.11 with glibc >= 2.28.
+
+   .. versionadded:: next
+
+
 .. function:: statvfs(path)
 
    Perform a :c:func:`!statvfs` system call on the given path.  The return value is
